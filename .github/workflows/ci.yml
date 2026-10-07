@@ -13,8 +13,12 @@ concurrency:
   group: ci-${{ github.sha }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   PYTHON_VERSION: "3.12"
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   freeze-worker:
@@ -35,7 +39,30 @@ jobs:
           python -m pip install -r requirements-windows.txt
           $env:PYTHONPATH = (Get-Location).Path
 
+      - name: Check pinned models GitHub Release
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(grep '^MODELS_RELEASE_TAG=' project.conf | cut -d= -f2 | tr -d '[:space:]')
+          test -n "$TAG"
+          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Pinned $TAG not published yet; will prefetch"
+          fi
+
+      - name: Download pinned torch cache
+        if: steps.pin.outputs.exists == 'true'
+        shell: pwsh
+        run: |
+          $env:DEMUCS_TORCH_CACHE = Join-Path (Get-Location) "models"
+          pwsh -File scripts/fetch_torch_models.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Restore Demucs torch checkpoint cache
+        if: steps.pin.outputs.exists != 'true'
         uses: actions/cache@v4
         id: torch-model-cache
         with:
@@ -45,7 +72,7 @@ jobs:
           key: htdemucs-6s-torch-hf-${{ hashFiles('requirements-windows.txt', 'demucs_torch/separate.py') }}
 
       - name: Prefetch official Demucs weights
-        if: steps.torch-model-cache.outputs.cache-hit != 'true'
+        if: steps.pin.outputs.exists != 'true' && steps.torch-model-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $env:DEMUCS_TORCH_PYTHON = (Get-Command python).Source

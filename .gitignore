@@ -4,6 +4,8 @@ __pycache__/
 dist/
 models/torch/
 models/hf/
+models/*.zip
+models/*.sha256
 .DS_Store
 *.pyc
 .pytest_cache/

@@ -35,9 +35,21 @@ pwsh -File scripts/freeze_worker_torch.ps1
 # → dist/worker/demucs_torch_worker/demucs_torch_worker.exe
 ```
 
-CI (`make ci` from git bash, or GitHub Actions `workflow_dispatch`) freezes the worker
-and uploads `demucs-cuda-windows-worker`. Product zips and itch.io shipping are in
-demucs-ui-app.
+CI (`make ci` from git bash) freezes the worker and uploads a 90-day Actions artifact.
+Permanent pins:
+
+```bash
+make release          # tag v$(VERSION) from project.conf
+make release-watch
+```
+
+That publishes `demucs-cuda-windows-worker-vX.Y.Z.zip` (skipped if ≥ 2 GiB) plus
+`htdemucs-6s-torch-cache.zip` on a GitHub Release, and creates the immutable weights
+tag in `MODELS_RELEASE_TAG` the first time. Later CI downloads that tag instead of
+re-prefetching from Meta. Product zips / itch.io stay in demucs-ui-app.
+
+Official checkpoints already live on Meta/Hugging Face via `demucs.pretrained`. The
+GitHub `models-htdemucs-6s-torch-1` release is only an offline cache pin for freeze/CI.
 
 ## Env vars
 

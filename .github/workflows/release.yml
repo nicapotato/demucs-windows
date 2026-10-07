@@ -1,0 +1,259 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version override (leave empty to use project.conf)"
+        required: false
+        default: ""
+        type: string
+      publish_gh_release:
+        description: "Create git tag + GitHub Release assets"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  read-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      models_tag: ${{ steps.v.outputs.models_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            V="${INPUT_VERSION}"
+          else
+            V=$(grep '^VERSION=' project.conf | cut -d= -f2 | tr -d '[:space:]')
+          fi
+          MODELS_TAG=$(grep '^MODELS_RELEASE_TAG=' project.conf | cut -d= -f2 | tr -d '[:space:]')
+          if [ -z "$V" ]; then
+            echo "ERROR: empty VERSION" >&2
+            exit 1
+          fi
+          if [ -z "$MODELS_TAG" ]; then
+            echo "ERROR: empty MODELS_RELEASE_TAG in project.conf" >&2
+            exit 1
+          fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+          echo "models_tag=${MODELS_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${V} (tag v${V}); models ${MODELS_TAG}"
+
+  freeze-worker:
+    runs-on: windows-latest
+    needs: read-version
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.read-version.outputs.version }}
+      MODELS_TAG: ${{ needs.read-version.outputs.models_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CUDA torch + Demucs + freeze deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.2.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cu121
+          python -m pip install -r requirements-windows.txt
+          $env:PYTHONPATH = (Get-Location).Path
+
+      - name: Check pinned models GitHub Release
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${MODELS_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Using pinned ${MODELS_TAG}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Pinned ${MODELS_TAG} not published yet; will prefetch"
+          fi
+
+      - name: Download pinned torch cache
+        if: steps.pin.outputs.exists == 'true'
+        shell: pwsh
+        run: |
+          $env:DEMUCS_TORCH_CACHE = Join-Path (Get-Location) "models"
+          pwsh -File scripts/fetch_torch_models.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Restore Demucs torch checkpoint cache
+        if: steps.pin.outputs.exists != 'true'
+        uses: actions/cache@v4
+        id: torch-model-cache
+        with:
+          path: |
+            models/torch
+            models/hf
+          key: htdemucs-6s-torch-hf-${{ hashFiles('requirements-windows.txt', 'demucs_torch/separate.py') }}
+
+      - name: Prefetch official Demucs weights
+        if: steps.pin.outputs.exists != 'true' && steps.torch-model-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $env:DEMUCS_TORCH_PYTHON = (Get-Command python).Source
+          pwsh -File scripts/prefetch_torch_models.ps1
+
+      - name: Freeze torch worker (PyInstaller)
+        shell: pwsh
+        run: |
+          $env:DEMUCS_TORCH_PYTHON = (Get-Command python).Source
+          pwsh -File scripts/freeze_worker_torch.ps1
+          if (-not (Test-Path "dist/worker/demucs_torch_worker/demucs_torch_worker.exe")) { exit 1 }
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          python - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          assets = Path("release-assets")
+          assets.mkdir(exist_ok=True)
+          worker = assets / f"demucs-cuda-windows-worker-v{version}"
+          models = assets / "htdemucs-6s-torch-cache"
+          shutil.make_archive(str(worker), "zip", "dist/worker", "demucs_torch_worker")
+          shutil.make_archive(str(models), "zip", "models")
+          worker_zip = worker.with_suffix(".zip")
+          models_zip = models.with_suffix(".zip")
+          worker_bytes = worker_zip.stat().st_size
+          models_bytes = models_zip.stat().st_size
+          print(f"packaged {worker_zip} ({worker_bytes} bytes)")
+          print(f"packaged {models_zip} ({models_bytes} bytes)")
+          if models_bytes <= 1_000_000:
+              raise SystemExit(f"models zip too small: {models_bytes}")
+          if models_bytes >= 2_147_483_648:
+              raise SystemExit(f"models zip exceeds GitHub 2 GiB asset cap: {models_bytes}")
+          gh_env = os.environ.get("GITHUB_ENV")
+          assert gh_env, "GITHUB_ENV missing"
+          with open(gh_env, "a", encoding="utf-8") as fh:
+              fh.write(f"WORKER_BYTES={worker_bytes}\n")
+          if worker_bytes >= 2_147_483_648:
+              print(f"Worker zip is {worker_bytes} bytes (>= 2 GiB). Dropping from GitHub Release assets.")
+              worker_zip.unlink()
+          PY
+          (
+            cd release-assets
+            sha256sum ./* | tee SHA256SUMS
+            if [ -f "demucs-cuda-windows-worker-v${VERSION}.zip" ]; then
+              sha256sum "demucs-cuda-windows-worker-v${VERSION}.zip" \
+                | tee "demucs-cuda-windows-worker-v${VERSION}.zip.sha256"
+            fi
+            sha256sum htdemucs-6s-torch-cache.zip | tee htdemucs-6s-torch-cache.zip.sha256
+          )
+          ls -la release-assets/
+
+      - name: Upload release assets artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: demucs-cuda-windows-worker-release
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish-gh-release:
+    runs-on: ubuntu-latest
+    needs: [read-version, freeze-worker]
+    if: github.event.inputs.publish_gh_release == 'true'
+    env:
+      TAG: ${{ needs.read-version.outputs.tag }}
+      VERSION: ${{ needs.read-version.outputs.version }}
+      MODELS_TAG: ${{ needs.read-version.outputs.models_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Guard duplicate worker tag
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "ERROR: Tag ${TAG} already exists; bump VERSION in project.conf" >&2
+            exit 1
+          fi
+          echo "Tag ${TAG} is available"
+
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          name: demucs-cuda-windows-worker-release
+          path: release-assets
+
+      - name: Create worker GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          name: demucs-windows ${{ env.TAG }}
+          generate_release_notes: true
+          body: |
+            Frozen CUDA worker for [demucs-ui-app](https://github.com/nicapotato/demucs-ui-app).
+
+            ## Assets
+            - `demucs-cuda-windows-worker-v${{ env.VERSION }}.zip` — PyInstaller onedir (omitted if ≥ 2 GiB)
+            - `htdemucs-6s-torch-cache.zip` — official Demucs torch/HF checkpoint cache
+
+            Weights are also pinned on immutable release `${{ env.MODELS_TAG }}`.
+            Bump `MODELS_RELEASE_TAG` in `project.conf` only when checkpoints change.
+          files: |
+            release-assets/*
+
+      - name: Pin or verify immutable models release
+        run: |
+          set -euo pipefail
+          ZIP="release-assets/htdemucs-6s-torch-cache.zip"
+          HASH="release-assets/htdemucs-6s-torch-cache.zip.sha256"
+          test -f "$ZIP"
+          test -f "$HASH"
+          if gh release view "${MODELS_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            mkdir -p /tmp/pin
+            gh release download "${MODELS_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              -p 'htdemucs-6s-torch-cache.zip.sha256' -D /tmp/pin
+            if ! cmp -s "$HASH" /tmp/pin/htdemucs-6s-torch-cache.zip.sha256; then
+              echo "ERROR: torch cache sha256 does not match ${MODELS_TAG}." >&2
+              echo "Bump MODELS_RELEASE_TAG in project.conf to publish a new weights pin." >&2
+              echo "pinned:" >&2
+              cat /tmp/pin/htdemucs-6s-torch-cache.zip.sha256 >&2
+              echo "this build:" >&2
+              cat "$HASH" >&2
+              exit 1
+            fi
+            echo "${MODELS_TAG} sha256 matches this build"
+          else
+            gh release create "${MODELS_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "Torch weights ${MODELS_TAG}" \
+              --notes "Immutable official Demucs htdemucs_6s torch/HF cache. Do not overwrite. To ship new weights, bump MODELS_RELEASE_TAG in project.conf and cut another worker release." \
+              --latest=false \
+              "$ZIP" "$HASH"
+            echo "Created ${MODELS_TAG}"
+          fi
