@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version override (leave empty to use project.conf)"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: ci-${{ github.sha }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  freeze-worker:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CUDA torch + Demucs + freeze deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.2.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cu121
+          python -m pip install -r requirements-windows.txt
+          $env:PYTHONPATH = (Get-Location).Path
+
+      - name: Restore Demucs torch checkpoint cache
+        uses: actions/cache@v4
+        id: torch-model-cache
+        with:
+          path: |
+            models/torch
+            models/hf
+          key: htdemucs-6s-torch-hf-${{ hashFiles('requirements-windows.txt', 'demucs_torch/separate.py') }}
+
+      - name: Prefetch official Demucs weights
+        if: steps.torch-model-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $env:DEMUCS_TORCH_PYTHON = (Get-Command python).Source
+          pwsh -File scripts/prefetch_torch_models.ps1
+
+      - name: Freeze torch worker (PyInstaller)
+        shell: pwsh
+        run: |
+          $env:DEMUCS_TORCH_PYTHON = (Get-Command python).Source
+          pwsh -File scripts/freeze_worker_torch.ps1
+          if (-not (Test-Path "dist/worker/demucs_torch_worker/demucs_torch_worker.exe")) { exit 1 }
+
+      - name: Upload worker artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: demucs-cuda-windows-worker
+          path: |
+            dist/worker/demucs_torch_worker
+            models
+          if-no-files-found: error
