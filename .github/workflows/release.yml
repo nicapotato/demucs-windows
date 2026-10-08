@@ -129,37 +129,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p release-assets
-          python - <<'PY'
-          import os
-          import shutil
-          from pathlib import Path
-
-          version = os.environ["VERSION"]
-          assets = Path("release-assets")
-          assets.mkdir(exist_ok=True)
-          worker = assets / f"demucs-cuda-windows-worker-v{version}"
-          models = assets / "htdemucs-6s-torch-cache"
-          shutil.make_archive(str(worker), "zip", "dist/worker", "demucs_torch_worker")
-          shutil.make_archive(str(models), "zip", "models")
-          worker_zip = worker.with_suffix(".zip")
-          models_zip = models.with_suffix(".zip")
-          worker_bytes = worker_zip.stat().st_size
-          models_bytes = models_zip.stat().st_size
-          print(f"packaged {worker_zip} ({worker_bytes} bytes)")
-          print(f"packaged {models_zip} ({models_bytes} bytes)")
-          if models_bytes <= 1_000_000:
-              raise SystemExit(f"models zip too small: {models_bytes}")
-          if models_bytes >= 2_147_483_648:
-              raise SystemExit(f"models zip exceeds GitHub 2 GiB asset cap: {models_bytes}")
-          gh_env = os.environ.get("GITHUB_ENV")
-          assert gh_env, "GITHUB_ENV missing"
-          with open(gh_env, "a", encoding="utf-8") as fh:
-              fh.write(f"WORKER_BYTES={worker_bytes}\n")
-          if worker_bytes >= 2_147_483_648:
-              print(f"Worker zip is {worker_bytes} bytes (>= 2 GiB). Dropping from GitHub Release assets.")
-              worker_zip.unlink()
-          PY
+          python scripts/package_release.py
           (
             cd release-assets
             sha256sum ./* | tee SHA256SUMS
@@ -222,7 +192,6 @@ jobs:
             - `htdemucs-6s-torch-cache.zip` — official Demucs torch/HF checkpoint cache
 
             Weights are also pinned on immutable release `${{ env.MODELS_TAG }}`.
-            Bump `MODELS_RELEASE_TAG` in `project.conf` only when checkpoints change.
           files: |
             release-assets/*
 
